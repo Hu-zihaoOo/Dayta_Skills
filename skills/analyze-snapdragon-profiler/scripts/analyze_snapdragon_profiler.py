@@ -10,7 +10,7 @@ import sys
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Iterable, Sequence
 
 
 REQUIRED_COLUMNS = {
@@ -802,10 +802,605 @@ def render_rule_report(summary: ProfileSummary, issues: list[BottleneckIssue], *
     return "\n".join(lines).rstrip() + "\n"
 
 
+UNITY_CPU_REQUIRED_COLUMNS = {
+    "frame",
+    "thread",
+    "sample",
+    "depth",
+    "startMs",
+    "durationMs",
+}
+
+
+@dataclass
+class CpuOpenSample:
+    frame: int
+    thread: str
+    sample: str
+    depth: int
+    inclusive_ms: float
+    child_ms: float = 0.0
+
+
+def percentile_values(values: list[float], q: float) -> float:
+    return percentile(sorted(values), q) if values else math.nan
+
+
+def classify_cpu_marker(sample: str) -> str:
+    if not sample:
+        return "ThreadRoot"
+    name = sample.lower()
+    if name == "idle" or "semaphore.waitforsignal" in name:
+        return "Waiting"
+    if "gc.alloc" in name or "garbagecollect" in name or "gc." in name:
+        return "GC"
+    if "script" in name or "behaviour" in name or "mono" in name:
+        return "Scripts"
+    if "physics" in name:
+        return "Physics"
+    if "canvas" in name or "layout" in name or "graphic" in name or "ugui" in name or "ui." in name:
+        return "UI"
+    if "anim" in name:
+        return "Animation"
+    if "render" in name or "camera" in name or "gfx" in name or "draw" in name or "cull" in name:
+        return "Rendering"
+    if "audio" in name:
+        return "Audio"
+    if "load" in name or "asset" in name or "resource" in name:
+        return "Loading"
+    if "profiler" in name:
+        return "Profiler"
+    return "Other"
+
+
+def is_reportable_cpu_marker(sample: str) -> bool:
+    if not sample:
+        return False
+    if sample in {"Main Thread", "Render Thread", "Idle", "Semaphore.WaitForSignal"}:
+        return False
+    if sample.startswith("Profiler."):
+        return False
+    return True
+
+
+def is_main_thread(thread: str) -> bool:
+    return thread.strip().lower() == "main thread"
+
+
+def is_render_thread(thread: str) -> bool:
+    return "render" in thread.strip().lower()
+
+
+def read_unity_cpu_rows(path: Path) -> Iterable[dict[str, object]]:
+    if not path.exists():
+        raise CsvLoadError(f"CSV 文件不存在: {path}")
+    if not path.is_file():
+        raise CsvLoadError(f"路径不是文件: {path}")
+
+    with path.open("r", encoding="utf-8-sig", newline="") as file:
+        reader = csv.DictReader(file)
+        if reader.fieldnames is None:
+            raise CsvLoadError("CSV 为空或缺少表头")
+        missing = UNITY_CPU_REQUIRED_COLUMNS.difference(reader.fieldnames)
+        if missing:
+            raise CsvLoadError(f"Unity CPU CSV 缺少必要列: {', '.join(sorted(missing))}")
+
+        for index, raw in enumerate(reader, start=2):
+            frame = parse_int(raw.get("frame") or "", row_number=index, column="frame")
+            depth = parse_int(raw.get("depth") or "", row_number=index, column="depth")
+            parse_float(raw.get("startMs") or "", row_number=index, column="startMs")
+            duration_ms = parse_float(raw.get("durationMs") or "", row_number=index, column="durationMs")
+            yield {
+                "frame": frame,
+                "thread": raw.get("thread") or "",
+                "sample": raw.get("sample") or "",
+                "depth": depth,
+                "duration_ms": duration_ms,
+            }
+
+
+def write_dict_csv(path: Path, fieldnames: list[str], rows: Iterable[dict[str, object]]) -> None:
+    with path.open("w", encoding="utf-8", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def cpu_issue(
+    *,
+    title: str,
+    severity: str,
+    score: float,
+    evidence: str,
+    interpretation: str,
+    recommendation: str,
+    confidence: str = "medium",
+) -> dict[str, object]:
+    return {
+        "title": title,
+        "severity": severity,
+        "score": score,
+        "evidence": evidence,
+        "interpretation": interpretation,
+        "recommendation": recommendation,
+        "confidence": confidence,
+    }
+
+
+def evaluate_unity_cpu_rules(
+    frame_rows: list[dict[str, object]],
+    reportable_marker_rows: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    issues: list[dict[str, object]] = []
+    main_times = [float(row["main_thread_ms"]) for row in frame_rows]
+    if main_times:
+        avg_main = sum(main_times) / len(main_times)
+        p95_main = percentile_values(main_times, 0.95)
+        max_main = max(main_times)
+        over_16 = sum(1 for value in main_times if value > 16.67)
+        over_33 = sum(1 for value in main_times if value > 33.33)
+        if p95_main > 16.67:
+            severity = "high" if p95_main > 33.33 else "medium"
+            score = 90 if severity == "high" else 65
+            issues.append(
+                cpu_issue(
+                    title="Main Thread 帧时超过 60 FPS 预算",
+                    severity=severity,
+                    score=score + min(15, max(0.0, p95_main - 16.67)),
+                    evidence=(
+                        f"avg={avg_main:.3f} ms, p95={p95_main:.3f} ms, max={max_main:.3f} ms, "
+                        f"frames>16.67ms={over_16}/{len(main_times)}, frames>33.33ms={over_33}/{len(main_times)}"
+                    ),
+                    interpretation="Main Thread 聚合帧时超过 16.67 ms，按 60 FPS 预算存在 CPU 侧稳定性风险。",
+                    recommendation="优先查看 worst frames 的 Top Main Self Markers，先处理高 self-time 且高频出现的脚本、UI、渲染提交或等待 marker。",
+                    confidence="high",
+                )
+            )
+        if over_33 > 0:
+            issues.append(
+                cpu_issue(
+                    title="Main Thread 存在 30 FPS 预算风险帧",
+                    severity="medium",
+                    score=72 + min(10, over_33),
+                    evidence=f"frames>33.33ms={over_33}/{len(main_times)}, max={max_main:.3f} ms",
+                    interpretation="至少一帧 Main Thread 超过 33.33 ms，存在明显 spike / jank 风险。",
+                    recommendation="按 `unity_cpu_worst_frames.csv` 定位这些帧的 top self/inclusive marker，并对对应系统做 A/B 关闭或降级验证。",
+                    confidence="high",
+                )
+            )
+
+    total_reportable_self = sum(float(row["total_self_ms"]) for row in reportable_marker_rows)
+    category_self: Counter[str] = Counter()
+    for row in reportable_marker_rows:
+        category_self[str(row["category"])] += float(row["total_self_ms"])
+
+    for category, threshold, severity, title, recommendation in [
+        ("UI", 10.0, "medium", "UI self-time 占比较高", "检查 Canvas rebuild、Layout、Graphic、UGUI batch 更新和频繁 SetActive/RectTransform 变更。"),
+        ("Rendering", 15.0, "medium", "Rendering self-time 占比较高", "检查渲染提交、Present、culling、draw/queue 相关 marker，并结合 GPU counter 判断 CPU 提交或 GPU 等待。"),
+        ("Waiting", 10.0, "medium", "Waiting self-time 占比较高", "检查 Job 等待、RenderThread/GPU 同步、VSync、Present 和线程间同步点。"),
+    ]:
+        if total_reportable_self <= 0:
+            continue
+        pct = category_self[category] / total_reportable_self * 100.0
+        if pct >= threshold:
+            issues.append(
+                cpu_issue(
+                    title=title,
+                    severity=severity,
+                    score=60 + min(20, pct - threshold),
+                    evidence=f"{category} total_self={category_self[category]:.3f} ms, reportable_self_pct={pct:.2f}%",
+                    interpretation=f"{category} 类 marker 在可报告 self-time 中占比较高。",
+                    recommendation=recommendation,
+                    confidence="medium",
+                )
+            )
+
+    gc_markers = [row for row in reportable_marker_rows if row["category"] == "GC"]
+    if gc_markers:
+        max_gc_self = max(float(row["max_self_ms"]) for row in gc_markers)
+        total_gc_self = sum(float(row["total_self_ms"]) for row in gc_markers)
+        if max_gc_self >= 2.0:
+            issues.append(
+                cpu_issue(
+                    title="GC marker 存在单次高 self-time",
+                    severity="medium",
+                    score=68 + min(12, max_gc_self),
+                    evidence=f"GC total_self={total_gc_self:.3f} ms, max_self={max_gc_self:.3f} ms",
+                    interpretation="GC 相关 marker 出现毫秒级 self-time，可能造成单帧 spike。",
+                    recommendation="检查对应 worst frame 的 GC.Alloc/Collect marker，减少热路径分配并验证 Incremental GC 设置。",
+                    confidence="medium",
+                )
+            )
+
+    profiler_p95 = percentile_values([float(row["profiler_overhead_ms"]) for row in frame_rows], 0.95) if frame_rows else math.nan
+    profiler_max = max((float(row["profiler_overhead_ms"]) for row in frame_rows), default=0.0)
+    if profiler_p95 >= 1.0 or profiler_max >= 2.0:
+        issues.append(
+            cpu_issue(
+                title="Profiler overhead 偏高",
+                severity="low",
+                score=40 + min(10, profiler_max),
+                evidence=f"profiler_overhead p95={profiler_p95:.3f} ms, max={profiler_max:.3f} ms",
+                interpretation="Profiler 自身开销在部分帧中不可忽略，可能影响绝对帧时判断。",
+                recommendation="复测时固定 Profiler 配置，必要时降低采样开销或用 Development Build/Release 对照。",
+                confidence="medium",
+            )
+        )
+
+    return sorted(issues, key=lambda item: float(item["score"]), reverse=True)
+
+
+def build_unity_cpu_context(
+    source: Path,
+    frame_rows: list[dict[str, object]],
+    marker_rows: list[dict[str, object]],
+    reportable_marker_rows: list[dict[str, object]],
+    category_rows: list[dict[str, object]],
+    worst_frame_rows: list[dict[str, object]],
+    issues: list[dict[str, object]],
+) -> dict[str, object]:
+    main_times = [float(row["main_thread_ms"]) for row in frame_rows]
+    render_times = [float(row["render_thread_ms"]) for row in frame_rows]
+    sample_count = sum(int(row["sample_count"]) for row in frame_rows)
+    return {
+        "summary": {
+            "source": str(source),
+            "frame_count": len(frame_rows),
+            "sample_count": sample_count,
+            "main_thread_avg_ms": sum(main_times) / len(main_times) if main_times else None,
+            "main_thread_p95_ms": percentile_values(main_times, 0.95) if main_times else None,
+            "main_thread_max_ms": max(main_times) if main_times else None,
+            "render_thread_avg_ms": sum(render_times) / len(render_times) if render_times else None,
+            "render_thread_p95_ms": percentile_values(render_times, 0.95) if render_times else None,
+            "render_thread_max_ms": max(render_times) if render_times else None,
+            "frames_over_16_67_ms": sum(1 for value in main_times if value > 16.67),
+            "frames_over_33_33_ms": sum(1 for value in main_times if value > 33.33),
+        },
+        "rule_issues": issues,
+        "marker_stats": reportable_marker_rows[:50],
+        "category_stats": category_rows,
+        "worst_frames": worst_frame_rows,
+        "data_boundaries": [
+            "Unity CPU CSV is RawFrameDataView-style CPU sample data only.",
+            "CPU CSV can identify CPU frame, thread, marker, category, self-time, inclusive-time, and worst-frame directions.",
+            "Do not infer GPU counters, GPU-bound status, device model, materials, shaders, draw calls, GameObjects, temperature, power, or thermal throttling from CPU CSV alone.",
+            "Marker names can suggest Unity systems, but aggregated CSV does not prove exact source code root cause without profiler timeline or project context.",
+        ],
+        "raw_marker_count": len(marker_rows),
+    }
+
+
+def analyze_unity_cpu(
+    source: Path,
+    out_dir: Path,
+    top_frames: int,
+    top_markers_per_frame: int,
+) -> dict[str, object]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    marker_calls: Counter[str] = Counter()
+    marker_frames: dict[str, set[int]] = defaultdict(set)
+    marker_inclusive_total: Counter[str] = Counter()
+    marker_self_total: Counter[str] = Counter()
+    marker_inclusive_values: dict[str, list[float]] = defaultdict(list)
+    marker_self_values: dict[str, list[float]] = defaultdict(list)
+    marker_max_inclusive: Counter[str] = Counter()
+    marker_max_self: Counter[str] = Counter()
+
+    category_self_total: Counter[str] = Counter()
+    category_inclusive_total: Counter[str] = Counter()
+    category_calls: Counter[str] = Counter()
+
+    frame_data: dict[int, dict[str, object]] = defaultdict(
+        lambda: {
+            "thread_count": set(),
+            "sample_count": 0,
+            "main_thread_ms": 0.0,
+            "render_thread_ms": 0.0,
+            "other_thread_root_max_ms": 0.0,
+            "gc_alloc_count": 0,
+            "gc_alloc_time_ms": 0.0,
+            "profiler_overhead_ms": 0.0,
+            "main_marker_self": Counter(),
+            "main_marker_inclusive": Counter(),
+        }
+    )
+
+    stack: list[CpuOpenSample] = []
+    current_group: tuple[int, str] | None = None
+    row_count = 0
+
+    def close_sample() -> None:
+        node = stack.pop()
+        self_ms = max(0.0, node.inclusive_ms - node.child_ms)
+
+        marker_calls[node.sample] += 1
+        marker_frames[node.sample].add(node.frame)
+        marker_inclusive_total[node.sample] += node.inclusive_ms
+        marker_self_total[node.sample] += self_ms
+        marker_inclusive_values[node.sample].append(node.inclusive_ms)
+        marker_self_values[node.sample].append(self_ms)
+        marker_max_inclusive[node.sample] = max(marker_max_inclusive[node.sample], node.inclusive_ms)
+        marker_max_self[node.sample] = max(marker_max_self[node.sample], self_ms)
+
+        category = classify_cpu_marker(node.sample)
+        category_calls[category] += 1
+        category_inclusive_total[category] += node.inclusive_ms
+        category_self_total[category] += self_ms
+
+        data = frame_data[node.frame]
+        if node.sample == "GC.Alloc":
+            data["gc_alloc_count"] = int(data["gc_alloc_count"]) + 1
+            data["gc_alloc_time_ms"] = float(data["gc_alloc_time_ms"]) + node.inclusive_ms
+        if category == "Profiler":
+            data["profiler_overhead_ms"] = float(data["profiler_overhead_ms"]) + self_ms
+
+        if is_main_thread(node.thread):
+            data["main_marker_self"][node.sample] += self_ms
+            data["main_marker_inclusive"][node.sample] += node.inclusive_ms
+
+        if stack:
+            stack[-1].child_ms += node.inclusive_ms
+        elif node.depth == 0:
+            if is_main_thread(node.thread):
+                data["main_thread_ms"] = max(float(data["main_thread_ms"]), node.inclusive_ms)
+            elif is_render_thread(node.thread):
+                data["render_thread_ms"] = max(float(data["render_thread_ms"]), node.inclusive_ms)
+            else:
+                data["other_thread_root_max_ms"] = max(float(data["other_thread_root_max_ms"]), node.inclusive_ms)
+
+    for row in read_unity_cpu_rows(source):
+        row_count += 1
+        frame = int(row["frame"])
+        thread = str(row["thread"])
+        sample = str(row["sample"])
+        depth = int(row["depth"])
+        duration_ms = float(row["duration_ms"])
+
+        data = frame_data[frame]
+        data["sample_count"] = int(data["sample_count"]) + 1
+        thread_count = data["thread_count"]
+        if isinstance(thread_count, set):
+            thread_count.add(thread)
+
+        group = (frame, thread)
+        if current_group != group:
+            while stack:
+                close_sample()
+            current_group = group
+
+        while stack and depth <= stack[-1].depth:
+            close_sample()
+
+        stack.append(CpuOpenSample(frame=frame, thread=thread, sample=sample, depth=depth, inclusive_ms=duration_ms))
+
+    while stack:
+        close_sample()
+
+    if row_count == 0:
+        raise CsvLoadError("Unity CPU CSV 没有数据行")
+
+    marker_rows: list[dict[str, object]] = []
+    for sample, calls in marker_calls.items():
+        inclusive_total = marker_inclusive_total[sample]
+        self_total = marker_self_total[sample]
+        self_values = marker_self_values[sample]
+        inclusive_values = marker_inclusive_values[sample]
+        marker_rows.append(
+            {
+                "sample": sample,
+                "category": classify_cpu_marker(sample),
+                "calls": calls,
+                "frames": len(marker_frames[sample]),
+                "total_self_ms": round(self_total, 6),
+                "total_inclusive_ms": round(inclusive_total, 6),
+                "avg_self_ms": round(self_total / calls, 6),
+                "p50_self_ms": round(percentile_values(self_values, 0.50), 6),
+                "p95_self_ms": round(percentile_values(self_values, 0.95), 6),
+                "max_self_ms": round(marker_max_self[sample], 6),
+                "avg_inclusive_ms": round(inclusive_total / calls, 6),
+                "p95_inclusive_ms": round(percentile_values(inclusive_values, 0.95), 6),
+                "max_inclusive_ms": round(marker_max_inclusive[sample], 6),
+            }
+        )
+    marker_rows.sort(key=lambda item: (float(item["total_self_ms"]), float(item["max_self_ms"])), reverse=True)
+    reportable_marker_rows = [row for row in marker_rows if is_reportable_cpu_marker(str(row["sample"]))]
+    reportable_total_self_ms = sum(float(row["total_self_ms"]) for row in reportable_marker_rows)
+
+    frame_rows: list[dict[str, object]] = []
+    worst_frame_rows: list[dict[str, object]] = []
+    for frame, data in sorted(frame_data.items()):
+        main_ms = float(data["main_thread_ms"])
+        render_ms = float(data["render_thread_ms"])
+        other_thread_root_max_ms = float(data["other_thread_root_max_ms"])
+        sample_count = int(data["sample_count"])
+        thread_count = len(data["thread_count"]) if isinstance(data["thread_count"], set) else 0
+        gc_alloc_count = int(data["gc_alloc_count"])
+        gc_alloc_time_ms = float(data["gc_alloc_time_ms"])
+        profiler_overhead_ms = float(data["profiler_overhead_ms"])
+        frame_rows.append(
+            {
+                "frame": frame,
+                "main_thread_ms": round(main_ms, 6),
+                "render_thread_ms": round(render_ms, 6),
+                "other_thread_root_max_ms": round(other_thread_root_max_ms, 6),
+                "thread_count": thread_count,
+                "sample_count": sample_count,
+                "gc_alloc_count": gc_alloc_count,
+                "gc_alloc_time_ms": round(gc_alloc_time_ms, 6),
+                "profiler_overhead_ms": round(profiler_overhead_ms, 6),
+            }
+        )
+
+        main_marker_self = data["main_marker_self"]
+        main_marker_inclusive = data["main_marker_inclusive"]
+        top_self = [
+            item
+            for item in main_marker_self.most_common()
+            if is_reportable_cpu_marker(item[0])
+        ][:top_markers_per_frame]
+        top_inclusive = [
+            item
+            for item in main_marker_inclusive.most_common()
+            if is_reportable_cpu_marker(item[0])
+        ][:top_markers_per_frame]
+        worst_frame_rows.append(
+            {
+                "frame": frame,
+                "main_thread_ms": round(main_ms, 6),
+                "render_thread_ms": round(render_ms, 6),
+                "other_thread_root_max_ms": round(other_thread_root_max_ms, 6),
+                "sample_count": sample_count,
+                "gc_alloc_count": gc_alloc_count,
+                "top_main_self_markers": " | ".join(f"{name}:{value:.3f}" for name, value in top_self),
+                "top_main_inclusive_markers": " | ".join(f"{name}:{value:.3f}" for name, value in top_inclusive),
+            }
+        )
+    worst_frame_rows.sort(key=lambda item: float(item["main_thread_ms"]), reverse=True)
+    worst_frame_rows = worst_frame_rows[:top_frames]
+
+    category_rows: list[dict[str, object]] = []
+    for category, total_self in category_self_total.most_common():
+        calls = category_calls[category]
+        category_rows.append(
+            {
+                "category": category,
+                "calls": calls,
+                "total_self_ms": round(total_self, 6),
+                "total_inclusive_ms": round(category_inclusive_total[category], 6),
+                "avg_self_ms": round(total_self / calls, 6),
+            }
+        )
+
+    marker_path = out_dir / "unity_cpu_marker_summary.csv"
+    frame_path = out_dir / "unity_cpu_frame_summary.csv"
+    worst_path = out_dir / "unity_cpu_worst_frames.csv"
+    category_path = out_dir / "unity_cpu_category_summary.csv"
+    report_path = out_dir / "unity_cpu_summary.md"
+
+    write_dict_csv(
+        marker_path,
+        [
+            "sample",
+            "category",
+            "calls",
+            "frames",
+            "total_self_ms",
+            "total_inclusive_ms",
+            "avg_self_ms",
+            "p50_self_ms",
+            "p95_self_ms",
+            "max_self_ms",
+            "avg_inclusive_ms",
+            "p95_inclusive_ms",
+            "max_inclusive_ms",
+        ],
+        marker_rows,
+    )
+    write_dict_csv(
+        frame_path,
+        [
+            "frame",
+            "main_thread_ms",
+            "render_thread_ms",
+            "other_thread_root_max_ms",
+            "thread_count",
+            "sample_count",
+            "gc_alloc_count",
+            "gc_alloc_time_ms",
+            "profiler_overhead_ms",
+        ],
+        frame_rows,
+    )
+    write_dict_csv(
+        worst_path,
+        [
+            "frame",
+            "main_thread_ms",
+            "render_thread_ms",
+            "other_thread_root_max_ms",
+            "sample_count",
+            "gc_alloc_count",
+            "top_main_self_markers",
+            "top_main_inclusive_markers",
+        ],
+        worst_frame_rows,
+    )
+    write_dict_csv(category_path, ["category", "calls", "total_self_ms", "total_inclusive_ms", "avg_self_ms"], category_rows)
+
+    main_times = [float(row["main_thread_ms"]) for row in frame_rows]
+    over_16 = sum(1 for value in main_times if value > 16.67)
+    over_33 = sum(1 for value in main_times if value > 33.33)
+    report_lines = [
+        "# Unity CPU Profiler Summary",
+        "",
+        f"- Source: `{source}`",
+        f"- Frames: {len(frame_rows)}",
+        f"- Samples: {sum(int(row['sample_count']) for row in frame_rows)}",
+        f"- Main Thread avg: {sum(main_times) / len(main_times):.3f} ms" if main_times else "- Main Thread avg: n/a",
+        f"- Main Thread p95: {percentile_values(main_times, 0.95):.3f} ms" if main_times else "- Main Thread p95: n/a",
+        f"- Main Thread max: {max(main_times):.3f} ms" if main_times else "- Main Thread max: n/a",
+        f"- Frames > 16.67 ms: {over_16}",
+        f"- Frames > 33.33 ms: {over_33}",
+        "",
+        "## Top Self-Time Markers",
+        "",
+        "| Marker | Category | Total Self % | Calls | Max Self ms |",
+        "|---|---:|---:|---:|---:|",
+    ]
+    for row in reportable_marker_rows[:20]:
+        total_self_pct = (
+            float(row["total_self_ms"]) / reportable_total_self_ms * 100.0
+            if reportable_total_self_ms > 0
+            else 0.0
+        )
+        report_lines.append(
+            f"| {row['sample']} | {row['category']} | {total_self_pct:.2f}% | {row['calls']} | {row['max_self_ms']} |"
+        )
+
+    report_lines.extend(
+        [
+            "",
+            "## Worst Frames",
+            "",
+            "| Frame | Main ms | Render ms | GC Alloc Count | Top Main Self Markers |",
+            "|---:|---:|---:|---:|---|",
+        ]
+    )
+    for row in worst_frame_rows[:20]:
+        report_lines.append(
+            f"| {row['frame']} | {row['main_thread_ms']} | {row['render_thread_ms']} | {row['gc_alloc_count']} | {row['top_main_self_markers']} |"
+        )
+
+    report_path.write_text("\n".join(report_lines) + "\n", encoding="utf-8")
+
+    issues = evaluate_unity_cpu_rules(frame_rows, reportable_marker_rows)
+    context = build_unity_cpu_context(
+        source,
+        frame_rows,
+        marker_rows,
+        reportable_marker_rows,
+        category_rows,
+        worst_frame_rows,
+        issues,
+    )
+
+    return {
+        "marker_path": marker_path,
+        "frame_path": frame_path,
+        "worst_path": worst_path,
+        "category_path": category_path,
+        "report_path": report_path,
+        "frame_count": len(frame_rows),
+        "sample_count": sum(int(row["sample_count"]) for row in frame_rows),
+        "context": context,
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="analyze-snapdragon-profiler",
-        description="Analyze Snapdragon Profiler CSV captures without external LLM calls.",
+        description="Analyze Snapdragon Profiler GPU CSV and Unity Profiler CPU CSV captures without external LLM calls.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     analyze = subparsers.add_parser("analyze", help="Analyze one or more Snapdragon Profiler CSV files.")
@@ -817,6 +1412,12 @@ def build_parser() -> argparse.ArgumentParser:
     analyze.add_argument("--prompt", default=None, help="Compatibility flag; Codex reads references directly.")
     analyze.add_argument("--agent-prompt", default=None, help="Compatibility flag; Codex reads references directly.")
     analyze.add_argument("--env", default=None, help="Compatibility flag; env files are ignored.")
+    cpu = subparsers.add_parser("analyze-unity-cpu", help="Analyze Unity Profiler CPU CSV exported from RawFrameDataView.")
+    cpu.add_argument("csv", type=Path, help="Input CSV with frame,thread,sample,depth,startMs,durationMs columns.")
+    cpu.add_argument("--out-dir", type=Path, default=Path("unity_cpu_analysis"), help="Output directory.")
+    cpu.add_argument("--top-frames", type=int, default=100, help="Worst frame rows to export.")
+    cpu.add_argument("--top-markers-per-frame", type=int, default=12, help="Markers listed in each worst frame row.")
+    cpu.add_argument("--context-output", default=None, help="Write JSON evidence context for Codex analysis.")
     return parser
 
 
@@ -840,12 +1441,32 @@ def analyze_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def analyze_unity_cpu_command(args: argparse.Namespace) -> int:
+    result = analyze_unity_cpu(args.csv, args.out_dir, args.top_frames, args.top_markers_per_frame)
+    print(f"Frames: {result['frame_count']}")
+    print(f"Samples: {result['sample_count']}")
+    print(f"Report: {result['report_path']}")
+    print(f"Frame summary: {result['frame_path']}")
+    print(f"Marker summary: {result['marker_path']}")
+    print(f"Worst frames: {result['worst_path']}")
+    print(f"Category summary: {result['category_path']}")
+
+    if args.context_output:
+        context_path = Path(args.context_output)
+        context_path.write_text(json.dumps(result["context"], ensure_ascii=True, indent=2), encoding="utf-8")
+        print(f"Codex context written: {context_path}")
+
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
         if args.command == "analyze":
             return analyze_command(args)
+        if args.command == "analyze-unity-cpu":
+            return analyze_unity_cpu_command(args)
     except CsvLoadError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2

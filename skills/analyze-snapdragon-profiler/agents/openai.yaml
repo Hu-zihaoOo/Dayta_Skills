@@ -1,7 +1,7 @@
 interface:
   display_name: "Snapdragon Profiler Analyzer"
-  short_description: "Analyze Snapdragon Profiler CSV captures."
-  default_prompt: "Use $analyze-snapdragon-profiler to analyze Snapdragon Profiler CSV exports and produce a Markdown bottleneck report."
+  short_description: "Analyze GPU counters and Unity CPU CSVs."
+  default_prompt: "Use $analyze-snapdragon-profiler to analyze Snapdragon GPU counters or Unity CPU profiler CSV exports and produce a Markdown bottleneck report."
 
 policy:
   allow_implicit_invocation: true
